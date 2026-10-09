@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live TV — Now 新聞 / Bloomberg</title>
+
+<!-- Bloomberg 播放器用的就是 hls.js，這裡原樣保留 -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<!-- Now 的直播源是 MPEG-DASH（.mpd），沒有 HLS 版本，所以另外需要 dash.js -->
+<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+
+<style>
+  html, body { margin: 0; background-color: black; overflow: hidden; }
+  body { font-family: -apple-system, "PingFang HK", "Microsoft JhengHei", sans-serif; }
+
+  /* ---- 換台按鈕 ---- */
+  #tabs {
+    position: fixed; top: 12px; left: 12px; z-index: 20;
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  #tabs button {
+    padding: 7px 14px; border-radius: 999px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.35);
+    background: rgba(0,0,0,.55); color: #ddd;
+    font-size: 13px; backdrop-filter: blur(6px);
+    transition: background .15s, color .15s, border-color .15s;
+  }
+  #tabs button:hover { border-color: #fff; color: #fff; }
+  #tabs button.active { background: #e00; border-color: #e00; color: #fff; font-weight: 600; }
+
+  /* ---- 節目表抽屜（只有 Now 頻道顯示）---- */
+  #epgToggle {
+    position: fixed; top: 12px; right: 12px; z-index: 22;
+    padding: 7px 14px; border-radius: 999px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.35);
+    background: rgba(0,0,0,.55); color: #ddd; font-size: 13px;
+    backdrop-filter: blur(6px);
+  }
+  #epgToggle:hover { border-color: #fff; color: #fff; }
+  #epgPanel {
+    position: fixed; top: 54px; right: 12px; bottom: 12px; width: 320px; z-index: 21;
+    background: rgba(12,12,12,.82); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+    display: flex; flex-direction: column; overflow: hidden;
+    transition: transform .22s ease, opacity .22s ease;
+  }
+  #epgPanel.hidden { transform: translateX(115%); opacity: 0; pointer-events: none; }
+  #epgPanel h2 {
+    margin: 0; padding: 11px 14px; font-size: 13px; font-weight: 600; color: #eee;
+    border-bottom: 1px solid rgba(255,255,255,.12); flex: 0 0 auto;
+  }
+  #epgPanel h2 small { color: #888; font-weight: 400; }
+  #epg { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1 1 auto; }
+  #epg li {
+    display: grid; grid-template-columns: 92px 1fr; gap: 8px;
+    padding: 7px 14px; border-bottom: 1px solid rgba(255,255,255,.06);
+    font-size: 12.5px; line-height: 1.45;
+  }
+  #epg .t { color: #8fa6b8; font-variant-numeric: tabular-nums; }
+  #epg .n { color: #d5d5d5; }
+  #epg li.now { background: rgba(46,125,50,.22); }
+  #epg li.now .n { color: #7ee08a; font-weight: 600; }
+  #epg .badge {
+    font-size: 10px; background: #2e7d32; color: #fff;
+    border-radius: 3px; padding: 1px 4px; margin-left: 6px; vertical-align: 1px;
+  }
+  #epgEmpty { padding: 12px 14px; font-size: 12.5px; color: #999; }
+
+  /* ---- 底部狀態列 ---- */
+  #status {
+    position: fixed; left: 12px; bottom: 10px; right: 12px; z-index: 20;
+    font-size: 11px; color: rgba(255,255,255,.45);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  #status.err { color: #ff8080; }
+
+  /* 全螢幕時把覆蓋層收起來 */
+  video:fullscreen ~ #tabs, video:-webkit-full-screen ~ #tabs { display: none; }
+</style>
+</head>
+
+<body style="background-color:black;">
+  <!-- 影片元素沿用你給的 Bloomberg 播放器寫法 -->
+  <video id="video" class="videoCentered" autoplay="" controls="" muted=""
+         style="position: fixed; height: 100%; width: 100%">
+    <track kind="captions" label="English" srclang="en" src="data:,WEBVTT">
+  </video>
+
+  <div id="tabs"></div>
+  <button id="epgToggle" title="節目表（點擊開啟；閒置 5 秒自動隱藏；H 鍵切換）">節目表</button>
+
+  <aside id="epgPanel" class="hidden">
+    <h2>節目表 <small id="epgChannel"></small></h2>
+    <ul id="epg"><li><span class="t"></span><span class="n">載入中…</span></li></ul>
+  </aside>
+
+  <div id="status">準備中…</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ======================================================================
+     頻道表
+       - type 'hls'  → 走 Bloomberg 那套 hls.js 播放器
+       - type 'dash' → Now 的直播只有 DASH，必須用 dash.js（API 換 token）
+     ====================================================================== */
+  var CHANNELS = [
+    { key: '332',       label: '332 新聞台', type: 'dash', epg: '332' },
+    { key: '331',       label: '331 直播台', type: 'dash', epg: '331' },
+    { key: 'bloomberg', label: 'Bloomberg', type: 'hls',  epg: null,
+      src: 'https://liveprodusphoenixeast.global.ssl.fastly.net/USPhx-HD/Channel-TX-USPhx-AWS-virginia-1/Source-USPhx-16k-1-s6lk2-BP-07-02-81ykIWnsMsg_live.m3u8' }
+  ];
+
+  // Now 直播位址 API（news.now.com/home/live 播放器實際使用）
+  var LIVE_API = 'https://webtvapi.now.com/10/7/getLiveURL';
+  // 節目表 API（有 CORS: *，可直接跨域抓，不需要代理）
+  var EPG_API  = 'https://d2lsyikud1zuci.cloudfront.net/pccw-news-api/api/getChannelEPG';
+
+  // 節目表自動隱藏：閒置幾毫秒後收起（設 0 = 不自動隱藏，一直開著）
+  var EPG_AUTOHIDE_MS = 5000;
+
+  var video    = document.getElementById('video');
+  var tabsEl   = document.getElementById('tabs');
+  var statusEl = document.getElementById('status');
+  var panel    = document.getElementById('epgPanel');
+  var epgList  = document.getElementById('epg');
+  var epgChan  = document.getElementById('epgChannel');
+  var epgBtn   = document.getElementById('epgToggle');
+
+  var hlsPlayer  = null;   // Bloomberg 路徑
+  var dashPlayer = null;   // Now 路徑
+  var current    = null;
+  var tokenTimer = null;
+  var epgTimer   = null;
+  var epgHideTimer = null;
+  var epgHover   = false;   // 鼠標是否停在節目表上
+
+  function say(msg, isErr) {
+    statusEl.textContent = msg;
+    statusEl.className = isErr ? 'err' : '';
+  }
+
+  /* ---------------------- 播放器：Bloomberg / hls.js ---------------------- */
+  // 這段刻意跟你提供的 Bloomberg 播放器一致
+  function playHls(src) {
+    if (Hls.isSupported()) {
+      hlsPlayer = new Hls();
+      hlsPlayer.loadSource(src);
+      hlsPlayer.attachMedia(video);
+      hlsPlayer.on(Hls.Events.MANIFEST_PARSED, function () {
+        video.play();
+      });
+      hlsPlayer.on(Hls.Events.ERROR, function (evt, data) {   // 直播斷線自動重試
+        if (data && data.fatal) {
+          say('HLS 中斷（' + data.type + '），重試中…', true);
+          setTimeout(function () {
+            if (current && current.type === 'hls') { stopAll(); playHls(src); }
+          }, 2000);
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {   // Safari 原生 HLS
+      video.src = src;
+      video.addEventListener('loadedmetadata', function () { video.play(); });
+    } else {
+      say('這個瀏覽器不支援 HLS 播放。', true);
+    }
+  }
+
+  /* ---------------------- 播放器：Now / DASH ---------------------- */
+  function refNo() {
+    var d = new Date(), p = function (n) { return String(n).padStart(2, '0'); };
+    return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate())
+              + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+
+  function getNowStreamUrl(contentId) {
+    var body = {
+      contentId: contentId, contentType: 'Channel',
+      deviceId: 'WEB', deviceType: 'web', secureCookie: '',
+      callerReferenceNo: refNo(), profileId: ''
+    };
+    if (contentId === '332') { body.audioCode = 'N'; }   // 官方頁面對 332 多帶這個
+
+    return fetch(LIVE_API, {
+      method: 'POST',
+      mode: 'cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.responseCode !== 'SUCCESS' || !data.asset || !data.asset.length) {
+        throw new Error('API：' + (data.responseCode || 'UNKNOWN')
+          + (data.responseCode === 'NOT_LOGIN' ? '（需登入）' : ''));
+      }
+      return data.asset[0];
+    });
+  }
+
+  function playDash(contentId) {
+    say('正在取得 ' + contentId + ' 台的串流位址…');
+    getNowStreamUrl(contentId).then(function (url) {
+      if (!current || current.key !== contentId) { return; }   // 已經切走了
+      say(contentId + ' 播放中：' + url);
+      console.log('[stream]', contentId, url);
+
+      dashPlayer = dashjs.MediaPlayer().create();
+      dashPlayer.updateSettings({ streaming: { abr: { initialBitrate: { video: 1680 } } } });
+      dashPlayer.initialize(video, url, true);
+
+      dashPlayer.on(dashjs.MediaPlayer.events.ERROR, function () {
+        if (!current || current.type !== 'dash') { return; }
+        say('DASH 串流中斷，重新取得位址…', true);
+        setTimeout(function () {
+          if (current && current.type === 'dash') { stopAll(); playDash(contentId); }
+        }, 2000);
+      });
+
+      scheduleTokenRefresh(url, contentId);
+    }).catch(function (err) {
+      say('取得串流失敗：' + err.message, true);
+    });
+  }
+
+  // token 尾碼是到期 Unix 秒數（約 4 小時），提前 5 分鐘換新的
+  function scheduleTokenRefresh(url, contentId) {
+    clearTimeout(tokenTimer);
+    var m = /_(\d{10,})$/.exec(url);
+    if (!m) { return; }
+    var ms = Number(m[1]) * 1000 - Date.now() - 5 * 60 * 1000;
+    tokenTimer = setTimeout(function () {
+      if (current && current.key === contentId) { stopAll(); playDash(contentId); }
+    }, ms < 1000 ? 1000 : ms);
+  }
+
+  /* ---------------------- 播放器切換 ---------------------- */
+  function stopAll() {
+    clearTimeout(tokenTimer);
+    if (hlsPlayer) { try { hlsPlayer.destroy(); } catch (e) {} hlsPlayer = null; }
+    if (dashPlayer) { try { dashPlayer.reset(); } catch (e) {} dashPlayer = null; }
+    try {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    } catch (e) {}
+  }
+
+  /* ---------------------- 節目表（僅 Now 頻道） ---------------------- */
+  function hhmm(ms) {
+    return new Date(ms).toLocaleTimeString('zh-HK', {
+      hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'
+    });
+  }
+
+  function loadEPG(channelId) {
+    clearTimeout(epgTimer);
+    fetch(EPG_API + '?channelId=' + encodeURIComponent(channelId) + '&hour=24', { mode: 'cors' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!current || current.epg !== channelId) { return; }
+        var progs = data.channelPrograms || [];
+        epgChan.textContent = '（' + (data.chineseTitle || channelId) + '）';
+        epgList.innerHTML = '';
+
+        if (!progs.length) {
+          epgList.innerHTML = '<div id="epgEmpty">暫無節目資料</div>';
+        } else {
+          var now = Date.now();
+          progs.forEach(function (p) {
+            var li = document.createElement('li');
+            var isNow = now >= p.startTime && now < p.endTime;
+            if (isNow) { li.className = 'now'; }
+
+            var t = document.createElement('span');
+            t.className = 't';
+            t.textContent = hhmm(p.startTime) + '–' + hhmm(p.endTime);
+
+            var n = document.createElement('span');
+            n.className = 'n';
+            n.textContent = p.chineseTitle || p.englishTitle || '';
+            if (isNow) {
+              var b = document.createElement('span');
+              b.className = 'badge';
+              b.textContent = '播放中';
+              n.appendChild(b);
+            }
+
+            li.appendChild(t); li.appendChild(n);
+            epgList.appendChild(li);
+            if (isNow) { setTimeout(function () { li.scrollIntoView({ block: 'center' }); }, 0); }
+          });
+        }
+        // 每 60 秒重新同步「播放中」標記與當前節目
+        epgTimer = setTimeout(function () { loadEPG(channelId); }, 60000);
+      })
+      .catch(function (err) {
+        epgList.innerHTML = '';
+        var d = document.createElement('div');
+        d.id = 'epgEmpty';
+        d.textContent = '節目表載入失敗：' + err.message;
+        epgList.appendChild(d);
+      });
+  }
+
+  /* ---------------------- 節目表自動隱藏 ---------------------- */
+  function showEPGPanel() {
+    if (!current || !current.epg) { return; }   // Bloomberg 沒有節目表
+    panel.classList.remove('hidden');
+    scheduleEpgHide();
+  }
+
+  function hideEPGPanel() {
+    clearTimeout(epgHideTimer);
+    panel.classList.add('hidden');
+  }
+
+  function toggleEPGPanel() {
+    if (panel.classList.contains('hidden')) { showEPGPanel(); } else { hideEPGPanel(); }
+  }
+
+  function scheduleEpgHide() {
+    clearTimeout(epgHideTimer);
+    if (!EPG_AUTOHIDE_MS) { return; }
+    epgHideTimer = setTimeout(function () {
+      if (epgHover) { scheduleEpgHide(); return; }   // 還在看就再等一輪
+      hideEPGPanel();
+    }, EPG_AUTOHIDE_MS);
+  }
+
+  /* ---------------------- 換台 ---------------------- */
+  function switchTo(key) {
+    var ch = null;
+    for (var i = 0; i < CHANNELS.length; i++) {
+      if (CHANNELS[i].key === key) { ch = CHANNELS[i]; }
+    }
+    if (!ch) { return; }
+
+    current = ch;
+    stopAll();
+    clearTimeout(epgTimer);
+    clearTimeout(epgHideTimer);
+    epgHover = false;
+
+    Array.prototype.forEach.call(tabsEl.children, function (b) {
+      b.classList.toggle('active', b.dataset.key === key);
+    });
+
+    if (ch.epg) {
+      epgBtn.style.display = '';
+      epgChan.textContent = '';
+      epgList.innerHTML = '<li><span class="t"></span><span class="n">載入中…</span></li>';
+      loadEPG(ch.epg);         // 先預載，之後點開就有資料
+      hideEPGPanel();          // 預設不顯示，要手動點「節目表」才打開
+    } else {
+      // Bloomberg 不需要節目表
+      hideEPGPanel();
+      epgBtn.style.display = 'none';
+    }
+
+    if (ch.type === 'hls') {
+      say(ch.label + ' 播放中（hls.js）');
+      playHls(ch.src);
+    } else {
+      playDash(ch.key);
+    }
+  }
+
+  /* ---------------------- 初始化 UI ---------------------- */
+  CHANNELS.forEach(function (ch, idx) {
+    var b = document.createElement('button');
+    b.textContent = ch.label;
+    b.dataset.key = ch.key;
+    b.title = '快捷鍵 ' + (idx + 1);
+    b.addEventListener('click', function () { switchTo(ch.key); });
+    tabsEl.appendChild(b);
+  });
+
+  // 只靠手動點擊開關（不自動彈出）；打開後閒置會自動收起
+  epgBtn.addEventListener('click', function () { toggleEPGPanel(); });
+
+  // 鼠標停在面板上時不倒數
+  panel.addEventListener('mouseenter', function () { epgHover = true; clearTimeout(epgHideTimer); });
+  panel.addEventListener('mouseleave', function () { epgHover = false; scheduleEpgHide(); });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.target && /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) { return; }
+    var n = parseInt(e.key, 10);
+    if (n >= 1 && n <= CHANNELS.length) { switchTo(CHANNELS[n - 1].key); }
+    if (e.key === 'h' || e.key === 'H') { toggleEPGPanel(); }
+  });
+
+  switchTo('332');   // 預設 332 新聞台
+})();
+</script>
+</body>
+</html>
