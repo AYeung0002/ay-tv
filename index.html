@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title> — </title>
+<title>Live Working BGM</title>
 
 <!-- Bloomberg 播放器用的就是 hls.js，這裡原樣保留 -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -174,6 +174,8 @@
   var DASH_MAX_RETRY = 5;
   // 連續失敗幾次就放棄原生、改用官方播放器（每輪含 watchdog 約 10~15 秒）
   var FALLBACK_AFTER_RETRY = 2;
+  // 打 API 的逾時：超過就當失敗，不能讓狀態列永遠停在「正在取得位址」
+  var API_TIMEOUT_MS = 12000;
   // 卡死偵測：每 WATCHDOG_MS 檢查一次 currentTime，超過 STALL_MS 沒動就重取
   var WATCHDOG_MS = 3000;
   var STALL_MS    = 10000;
@@ -245,6 +247,9 @@
               + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
   }
 
+  // 用 XMLHttpRequest 而不是 fetch。
+  // 官方網頁（news.now.com）也是用 XHR（jQuery $.ajax）打這支 API，而它在 Safari 正常；
+  // 之前用 fetch 在 Safari 會一直 pending（不 resolve 也不 reject），狀態列就永遠停在「正在取得位址」。
   function getNowStreamUrl(contentId) {
     var body = {
       contentId: contentId, contentType: 'Channel',
@@ -253,28 +258,53 @@
     };
     if (contentId === '332') { body.audioCode = 'N'; }   // 官方頁面對 332 多帶這個
 
-    return fetch(LIVE_API, {
-      method: 'POST',
-      mode: 'cors',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-    .then(function (r) { return r.json(); })
-    .then(function (data) {
-      if (data.responseCode !== 'SUCCESS' || !data.asset || !data.asset.length) {
-        throw new Error('API：' + (data.responseCode || 'UNKNOWN')
-          + (data.responseCode === 'NOT_LOGIN' ? '（需登入）' : ''));
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', LIVE_API, true);
+      xhr.timeout = API_TIMEOUT_MS;                       // 逾時就當失敗，不要吊死
+      xhr.setRequestHeader('Content-Type', 'application/json');
+
+      xhr.onload = function () {
+        var data;
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch (e) {
+          return reject(new Error('回應不是 JSON（HTTP ' + xhr.status + '）'));
+        }
+        if (data.responseCode !== 'SUCCESS' || !data.asset || !data.asset.length) {
+          return reject(new Error('API：' + (data.responseCode || 'UNKNOWN')
+            + (data.responseCode === 'NOT_LOGIN' ? '（需登入）' : '')));
+        }
+        resolve(data.asset[0]);
+      };
+      xhr.onerror   = function () { reject(new Error('網路錯誤或被 CORS 擋住（HTTP ' + xhr.status + '）')); };
+      xhr.ontimeout = function () { reject(new Error('API 逾時 ' + (API_TIMEOUT_MS / 1000) + ' 秒')); };
+      xhr.onabort   = function () { reject(new Error('請求被中止')); };
+
+      try {
+        xhr.send(JSON.stringify(body));
+      } catch (e) {
+        reject(new Error('送出請求失敗：' + e.message));
       }
-      return data.asset[0];
     });
   }
 
-  function playDash(contentId) {
+  function playDash(contentId, attempt) {
+    attempt = attempt || 0;
     if (typeof dashjs === 'undefined') {
       say('dash.js 沒有載入成功，Now 頻道無法播放（CDN 被擋？）', true);
       return;
     }
-    say('正在取得 ' + contentId + ' 台的串流位址…');
+    // 舊版 iOS Safari 沒有 MediaSource，DASH 根本無法播 —— 直接跳官方播放器，不要空等
+    if (typeof window.MediaSource === 'undefined') {
+      if (current && current.official) {
+        showOfficial('這個瀏覽器沒有 MediaSource（iOS Safari 常見），無法播 DASH');
+      } else {
+        say('這個瀏覽器不支援 MediaSource，無法播放 DASH 串流。', true);
+      }
+      return;
+    }
+    say('正在取得 ' + contentId + ' 台的串流位址…（第 ' + (attempt + 1) + ' 次）');
     getNowStreamUrl(contentId).then(function (url) {
       if (!current || current.key !== contentId) { return; }   // 已經切走了
       console.log('[stream]', contentId, url);
@@ -303,6 +333,20 @@
       startWatchdog(contentId);
       scheduleTokenRefresh(url, contentId);
     }).catch(function (err) {
+      if (!current || current.key !== contentId) { return; }
+      console.error('[stream api error]', err);
+      if (attempt < 1) {                                  // 先重試一次
+        say('取得串流失敗（' + err.message + '），重試一次…', true);
+        setTimeout(function () {
+          if (current && current.key === contentId) { playDash(contentId, attempt + 1); }
+        }, 2000);
+        return;
+      }
+      // 連 API 都拿不到，就別再等原生播放器了
+      if (current.official) {
+        showOfficial('串流位址 API 失敗：' + err.message);
+        return;
+      }
       say('取得串流失敗：' + err.message, true);
     });
   }
@@ -413,10 +457,25 @@
     });
   }
 
+  // 通用 JSON GET（一樣走 XHR，避免 Safari 的 fetch 卡住）
+  function getJSON(url, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.timeout = timeoutMs || API_TIMEOUT_MS;
+      xhr.onload = function () {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch (e) { reject(new Error('回應不是 JSON（HTTP ' + xhr.status + '）')); }
+      };
+      xhr.onerror   = function () { reject(new Error('網路錯誤或被 CORS 擋住')); };
+      xhr.ontimeout = function () { reject(new Error('請求逾時')); };
+      xhr.send();
+    });
+  }
+
   function loadEPG(channelId) {
     clearTimeout(epgTimer);
-    fetch(EPG_API + '?channelId=' + encodeURIComponent(channelId) + '&hour=24', { mode: 'cors' })
-      .then(function (r) { return r.json(); })
+    getJSON(EPG_API + '?channelId=' + encodeURIComponent(channelId) + '&hour=24')
       .then(function (data) {
         if (!current || current.epg !== channelId) { return; }
         var progs = data.channelPrograms || [];
