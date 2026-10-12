@@ -3,7 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Live TV — Now 新聞 / Bloomberg</title>
+<title>-</title>
+<!-- Favicon：Font Awesome Free 6 的 fa-tv（Icons: CC BY 4.0, https://fontawesome.com）
+     白底灰字、正方形畫布；內嵌成 data URI，維持單一檔案、不需要額外請求 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20640%20640'%3E%3Crect%20width='640'%20height='640'%20rx='110'%20fill='%23ffffff'/%3E%3Cg%20transform='translate(320,320)%20scale(0.78)%20translate(-320,-256)'%3E%3Cpath%20fill='%23666666'%20d='M64%2064l0%20288%20512%200%200-288L64%2064zM0%2064C0%2028.7%2028.7%200%2064%200L576%200c35.3%200%2064%2028.7%2064%2064l0%20288c0%2035.3-28.7%2064-64%2064L64%20416c-35.3%200-64-28.7-64-64L0%2064zM128%20448l384%200c17.7%200%2032%2014.3%2032%2032s-14.3%2032-32%2032l-384%200c-17.7%200-32-14.3-32-32s14.3-32%2032-32z'/%3E%3C/g%3E%3C/svg%3E">
 
 <!-- Bloomberg 播放器用的就是 hls.js，這裡原樣保留 -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -162,6 +165,15 @@
       official: 'https://news.now.com/home/live331a' },
     { key: 'bloomberg', label: 'Bloomberg',  now: false, epg: null,
       src: 'https://liveprodusphoenixeast.global.ssl.fastly.net/USPhx-HD/Channel-TX-USPhx-AWS-virginia-1/Source-USPhx-16k-1-s6lk2-BP-07-02-81ykIWnsMsg_live.m3u8' }
+  ];
+
+  // 只能外連、無法內嵌的頻道。
+  // TVB 無綫新聞台（83）三層都擋：API 完全沒有 CORS 標頭、AES-128 金鑰的
+  // Access-Control-Allow-Origin 只允許 *.tvb.com、網頁本身又是 X-Frame-Options: DENY
+  // 加 CSP frame-ancestors 'none'（連 iframe 都不行）。所以只能開官方網站。
+  var EXTERNAL_LINKS = [
+    { label: 'TVB 新聞台 ↗', url: 'https://news.tvb.com/tc/live/C',
+      title: '無綫新聞台（83 台）—— TVB 禁止外部播放與嵌入，點此開官方網站' }
   ];
 
   // Now 直播位址 API（news.now.com/home/live 播放器實際使用）
@@ -630,6 +642,17 @@
     b.dataset.key = ch.key;
     b.title = '快捷鍵 ' + (idx + 1);
     b.addEventListener('click', function () { switchTo(ch.key); });
+    tabsEl.appendChild(b);
+  });
+
+  // 外連頻道（例如 TVB）：不進播放流程，單純另開分頁
+  EXTERNAL_LINKS.forEach(function (l) {
+    var b = document.createElement('button');
+    b.textContent = l.label;
+    b.title = l.title;
+    b.addEventListener('click', function () {
+      window.open(l.url, '_blank', 'noopener');
+    });
     tabsEl.appendChild(b);
   });
 
