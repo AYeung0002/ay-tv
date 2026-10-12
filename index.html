@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Live Working BGM</title>
+<title>Live TV — Now 新聞 / Bloomberg</title>
 
 <!-- Bloomberg 播放器用的就是 hls.js，這裡原樣保留 -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -155,11 +155,12 @@
        - type 'dash' → Now 的直播只有 DASH，必須用 dash.js（API 換 token）
      ====================================================================== */
   var CHANNELS = [
-    { key: '332',       label: '332 新聞台', type: 'dash', epg: '332',
+    // now:true = 走 webtvapi（格式由 API 依 UA 決定：桌面 DASH、行動裝置 HLS）
+    { key: '332',       label: '332 新聞台', now: true, epg: '332',
       official: 'https://news.now.com/home/live' },
-    { key: '331',       label: '331 直播台', type: 'dash', epg: '331',
+    { key: '331',       label: '331 直播台', now: true, epg: '331',
       official: 'https://news.now.com/home/live331a' },
-    { key: 'bloomberg', label: 'Bloomberg', type: 'hls',  epg: null,
+    { key: 'bloomberg', label: 'Bloomberg',  now: false, epg: null,
       src: 'https://liveprodusphoenixeast.global.ssl.fastly.net/USPhx-HD/Channel-TX-USPhx-AWS-virginia-1/Source-USPhx-16k-1-s6lk2-BP-07-02-81ykIWnsMsg_live.m3u8' }
   ];
 
@@ -198,12 +199,12 @@
   var epgTimer   = null;
   var epgHideTimer = null;
   var epgHover   = false;   // 鼠標是否停在節目表上
-  var dashRetry  = 0;       // dash.js 連續錯誤次數
+  var retryCount  = 0;       // dash.js 連續錯誤次數
   var watchTimer = null;    // 卡死偵測的 interval
   var watchLastCt = -1;
   var watchLastMove = 0;
   var watchHealthyMs = 0;
-  var lastDashError = '';   // 最近一次 dash.js 錯誤，出問題時顯示出來
+  var lastStreamError = '';   // 最近一次 dash.js 錯誤，出問題時顯示出來
 
   function say(msg, isErr) {
     statusEl.textContent = msg;
@@ -228,7 +229,7 @@
         if (data && data.fatal) {
           say('HLS 中斷（' + data.type + '），重試中…', true);
           setTimeout(function () {
-            if (current && current.type === 'hls') { stopAll(); playHls(src); }
+            if (current && !current.now) { stopAll(); playHls(src); }
           }, 2000);
         }
       });
@@ -289,47 +290,28 @@
     });
   }
 
-  function playDash(contentId, attempt) {
+  /* ---------------------- 播放 Now 頻道 ----------------------
+     ★ 關鍵：webtvapi 會「看 User-Agent 決定回哪種格式」
+         桌面 Chrome UA    → DASH（.mpd）   給 dash.js + MSE
+         iPhone/Android UA → HLS（.m3u8）   給 hls.js；iOS Safari 用原生 HLS（不需 MSE）
+     所以不能寫死用 dash.js —— 之前在 iOS 上就是把 API 回的 HLS 網址餵給
+     dash.js，必定失敗，才會一直退到官方播放器。現在改成看副檔名分派。 */
+  function playNow(contentId, attempt) {
     attempt = attempt || 0;
-    if (typeof dashjs === 'undefined') {
-      say('dash.js 沒有載入成功，Now 頻道無法播放（CDN 被擋？）', true);
-      return;
-    }
-    // 舊版 iOS Safari 沒有 MediaSource，DASH 根本無法播 —— 直接跳官方播放器，不要空等
-    if (typeof window.MediaSource === 'undefined') {
-      if (current && current.official) {
-        showOfficial('這個瀏覽器沒有 MediaSource（iOS Safari 常見），無法播 DASH');
-      } else {
-        say('這個瀏覽器不支援 MediaSource，無法播放 DASH 串流。', true);
-      }
-      return;
-    }
     say('正在取得 ' + contentId + ' 台的串流位址…（第 ' + (attempt + 1) + ' 次）');
+
     getNowStreamUrl(contentId).then(function (url) {
       if (!current || current.key !== contentId) { return; }   // 已經切走了
-      console.log('[stream]', contentId, url);
 
-      var ev = dashjs.MediaPlayer.events;
-      dashPlayer = dashjs.MediaPlayer().create();
-      dashPlayer.updateSettings({ streaming: { abr: { initialBitrate: { video: 1680 } } } });
+      var isHls = /\.m3u8(\?|$)/i.test(url);
+      console.log('[stream]', contentId, isHls ? 'HLS' : 'DASH', url);
+      say(contentId + ' 播放中（' + (isHls ? 'HLS' : 'DASH') + '）：' + url);
 
-      // 先把事件掛好再 initialize，免得漏掉初始化早期的錯誤
-      dashPlayer.on(ev.PLAYBACK_PLAYING, function () {
-        say(contentId + ' 播放中：' + url);
-      });
-
-      // 重點：dash.js 對很多錯誤（例如 MEDIA_ERR_DECODE）會自己重置 MediaSource 並恢復，
-      // 這些是「非致命」的。以前這裡一收到 ERROR 就把播放器整組打掉重來，結果明明在播
-      // 也被自己殺掉，然後無限迴圈。現在只記錄，真的卡死交給 watchdog 判斷。
-      dashPlayer.on(ev.ERROR, function (e) {
-        if (!current || current.type !== 'dash') { return; }
-        var err = (e && e.error) || {};
-        lastDashError = 'code=' + (err.code !== undefined ? err.code : '?')
-                      + (err.message ? ' / ' + err.message : '');
-        console.error('[dash.js error]', e);
-      });
-
-      dashPlayer.initialize(video, url, true);
+      if (isHls) {
+        playHlsSource(url);
+      } else {
+        playDashSource(url);
+      }
       startWatchdog(contentId);
       scheduleTokenRefresh(url, contentId);
     }).catch(function (err) {
@@ -338,7 +320,7 @@
       if (attempt < 1) {                                  // 先重試一次
         say('取得串流失敗（' + err.message + '），重試一次…', true);
         setTimeout(function () {
-          if (current && current.key === contentId) { playDash(contentId, attempt + 1); }
+          if (current && current.key === contentId) { playNow(contentId, attempt + 1); }
         }, 2000);
         return;
       }
@@ -351,6 +333,58 @@
     });
   }
 
+  // HLS：能用 hls.js 就用（Chrome/Android），Safari 走原生（iOS Safari 沒有 MSE）
+  function playHlsSource(url) {
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+      hlsPlayer = new Hls({ liveDurationInfinity: true });
+      hlsPlayer.loadSource(url);
+      hlsPlayer.attachMedia(video);
+      hlsPlayer.on(Hls.Events.MANIFEST_PARSED, function () { video.play(); });
+      hlsPlayer.on(Hls.Events.ERROR, function (evt, data) {
+        if (!data || !data.fatal) { return; }             // 非致命的自己會恢復
+        lastStreamError = 'hls.js ' + data.type + '/' + data.details;
+        console.error('[hls.js error]', data);
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;                                    // 原生 HLS（Safari）
+      video.addEventListener('loadedmetadata', function () { video.play(); });
+    } else {
+      say('這個瀏覽器不支援 HLS 播放。', true);
+    }
+  }
+
+  // DASH：只有桌面 Chrome 會走到這裡
+  function playDashSource(url) {
+    if (typeof dashjs === 'undefined' || typeof window.MediaSource === 'undefined') {
+      if (current && current.official) {
+        showOfficial('這個瀏覽器無法播 DASH（缺 dash.js 或 MediaSource）');
+      } else {
+        say('這個瀏覽器不支援 DASH 播放。', true);
+      }
+      return;
+    }
+
+    var ev = dashjs.MediaPlayer.events;
+    dashPlayer = dashjs.MediaPlayer().create();
+    dashPlayer.updateSettings({ streaming: { abr: { initialBitrate: { video: 1680 } } } });
+
+    // 先把事件掛好再 initialize，免得漏掉初始化早期的錯誤
+    dashPlayer.on(ev.PLAYBACK_PLAYING, function () { /* 狀態列已顯示播放中 */ });
+
+    // 重點：dash.js 對很多錯誤（例如 MEDIA_ERR_DECODE）會自己重置 MediaSource 並恢復，
+    // 這些是「非致命」的。以前這裡一收到 ERROR 就把播放器整組打掉重來，結果明明在播
+    // 也被自己殺掉，然後無限迴圈。現在只記錄，真的卡死交給 watchdog 判斷。
+    dashPlayer.on(ev.ERROR, function (e) {
+      if (!current || !current.now) { return; }
+      var err = (e && e.error) || {};
+      lastStreamError = 'code=' + (err.code !== undefined ? err.code : '?')
+                    + (err.message ? ' / ' + err.message : '');
+      console.error('[dash.js error]', e);
+    });
+
+    dashPlayer.initialize(video, url, true);
+  }
+
   /* ---------------------- 卡死偵測（watchdog） ----------------------
      不再信任 dash.js 的 ERROR 事件，改成直接看 currentTime 有沒有在前進：
      連續 STALL_MS 毫秒沒動、而且不是使用者自己按暫停，才真的重取位址。 */
@@ -360,21 +394,21 @@
     watchLastMove = Date.now();
     watchHealthyMs = 0;
     watchTimer = setInterval(function () {
-      if (!current || current.key !== contentId || current.type !== 'dash') { return; }
+      if (!current || current.key !== contentId || !current.now) { return; }
 
       var ct = video.currentTime;
       if (ct !== watchLastCt) {                    // 有在前進 → 健康
         watchLastCt = ct;
         watchLastMove = Date.now();
         watchHealthyMs += WATCHDOG_MS;
-        if (watchHealthyMs > 30000) { dashRetry = 0; }   // 穩定播 30 秒才重置重試次數
+        if (watchHealthyMs > 30000) { retryCount = 0; }   // 穩定播 30 秒才重置重試次數
         return;
       }
       if (video.paused) { watchLastMove = Date.now(); return; }   // 使用者自己按的暫停
 
       if (Date.now() - watchLastMove > STALL_MS) {
         watchLastMove = Date.now();
-        restartDash('畫面卡住 ' + Math.round(STALL_MS / 1000) + ' 秒沒動');
+        restartStream('畫面卡住 ' + Math.round(STALL_MS / 1000) + ' 秒沒動');
       }
     }, WATCHDOG_MS);
   }
@@ -383,27 +417,27 @@
     if (watchTimer) { clearInterval(watchTimer); watchTimer = null; }
   }
 
-  function restartDash(reason) {
-    if (!current || current.type !== 'dash') { return; }
+  function restartStream(reason) {
+    if (!current || !current.now) { return; }
 
     // 原生播放器連續失敗幾次就別再等了，直接換官方播放器（每輪約 10~15 秒）
-    if (current.official && dashRetry >= FALLBACK_AFTER_RETRY) {
-      showOfficial('原生 dash.js 連續失敗 ' + (dashRetry + 1) + ' 次：' + reason);
+    if (current.official && retryCount >= FALLBACK_AFTER_RETRY) {
+      showOfficial('原生 dash.js 連續失敗 ' + (retryCount + 1) + ' 次：' + reason);
       return;
     }
-    if (dashRetry >= DASH_MAX_RETRY) {
-      say('Now 頻道連續失敗 ' + (dashRetry + 1) + ' 次，已停止重試。原因：' + reason, true);
+    if (retryCount >= DASH_MAX_RETRY) {
+      say('Now 頻道連續失敗 ' + (retryCount + 1) + ' 次，已停止重試。原因：' + reason, true);
       return;
     }
-    dashRetry++;
+    retryCount++;
     watchHealthyMs = 0;
-    say('重新取得位址（第 ' + dashRetry + '/' + DASH_MAX_RETRY + ' 次）：' + reason, true);
+    say('重新取得位址（第 ' + retryCount + '/' + DASH_MAX_RETRY + ' 次）：' + reason, true);
 
     var id = current.key;
     stopAll();
     setTimeout(function () {
-      if (current && current.key === id) { playDash(id); }
-    }, 800 * dashRetry);
+      if (current && current.key === id) { playNow(id); }
+    }, 800 * retryCount);
   }
 
   /* ---------------------- 官方播放器後備 ----------------------
@@ -433,7 +467,7 @@
     if (!m) { return; }
     var ms = Number(m[1]) * 1000 - Date.now() - 5 * 60 * 1000;
     tokenTimer = setTimeout(function () {
-      if (current && current.key === contentId) { stopAll(); playDash(contentId); }
+      if (current && current.key === contentId) { stopAll(); playNow(contentId); }
     }, ms < 1000 ? 1000 : ms);
   }
 
@@ -561,8 +595,8 @@
     clearTimeout(epgTimer);
     clearTimeout(epgHideTimer);
     epgHover = false;
-    dashRetry = 0;
-    lastDashError = '';
+    retryCount = 0;
+    lastStreamError = '';
     if (offBtn) { offBtn.style.display = ch.official ? '' : 'none'; }
 
     Array.prototype.forEach.call(tabsEl.children, function (b) {
@@ -581,11 +615,11 @@
       epgBtn.style.display = 'none';
     }
 
-    if (ch.type === 'hls') {
+    if (ch.now) {
+      playNow(ch.key);            // 格式（DASH/HLS）由 API 依 UA 決定
+    } else {
       say(ch.label + ' 播放中（hls.js）');
       playHls(ch.src);
-    } else {
-      playDash(ch.key);
     }
   }
 
