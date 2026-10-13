@@ -171,9 +171,13 @@
   // TVB 無綫新聞台（83）三層都擋：API 完全沒有 CORS 標頭、AES-128 金鑰的
   // Access-Control-Allow-Origin 只允許 *.tvb.com、網頁本身又是 X-Frame-Options: DENY
   // 加 CSP frame-ancestors 'none'（連 iframe 都不行）。所以只能開官方網站。
+  // Viu 更硬：內容是 DRM 保護（enableDRM:true + FairPlay/Widevine 授權伺服器），
+  // API 還回 GEO_CHECK_FAIL（地區限制），網頁也是 X-Frame-Options: SAMEORIGIN。
   var EXTERNAL_LINKS = [
     { label: 'TVB 新聞台 ↗', url: 'https://news.tvb.com/tc/live/C',
-      title: '無綫新聞台（83 台）—— TVB 禁止外部播放與嵌入，點此開官方網站' }
+      title: '無綫新聞台（83 台）—— TVB 禁止外部播放與嵌入，點此開官方網站' },
+    { label: 'Viu 新聞重溫 ↗', url: 'https://viu.tv/encore/news',
+      title: 'ViuTV《新聞報道》重溫（VOD，非直播）—— 內容受 DRM 保護且有限區，只能開官方網站' }
   ];
 
   // Now 直播位址 API（news.now.com/home/live 播放器實際使用）
